@@ -36,17 +36,20 @@ namespace shell {
 constexpr char kSkiaChannel[] = "flutter/skia";
 
 std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
+    blink::DartVMRef vm,
     blink::TaskRunners task_runners,
     blink::Settings settings,
-    fml::RefPtr<blink::DartSnapshot> isolate_snapshot,
-    fml::RefPtr<blink::DartSnapshot> shared_snapshot,
+    fml::RefPtr<const blink::DartSnapshot> isolate_snapshot,
+    fml::RefPtr<const blink::DartSnapshot> shared_snapshot,
     Shell::CreateCallback<PlatformView> on_create_platform_view,
     Shell::CreateCallback<Rasterizer> on_create_rasterizer) {
   if (!task_runners.IsValid()) {
+    FML_LOG(ERROR) << "Task runners to run the shell were invalid.";
     return nullptr;
   }
 
-  auto shell = std::unique_ptr<Shell>(new Shell(task_runners, settings));
+  auto shell =
+      std::unique_ptr<Shell>(new Shell(std::move(vm), task_runners, settings));
 
   // Create the platform view on the platform thread (this thread).
   auto platform_view = on_create_platform_view(*shell.get());
@@ -75,6 +78,7 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
        &platform_view,  //
        io_task_runner   //
   ]() {
+        TRACE_EVENT0("flutter", "ShellSetupIOSubsystem");
         io_manager = std::make_unique<IOManager>(
             platform_view->CreateResourceContext(), io_task_runner);
         io_latch.Signal();
@@ -92,6 +96,7 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
                                         shell = shell.get(),   //
                                         &snapshot_delegate     //
   ]() {
+        TRACE_EVENT0("flutter", "ShellSetupGPUSubsystem");
         if (auto new_rasterizer = on_create_rasterizer(*shell)) {
           rasterizer = std::move(new_rasterizer);
           snapshot_delegate = rasterizer->GetSnapshotDelegate();
@@ -115,6 +120,7 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
                          snapshot_delegate = std::move(snapshot_delegate),  //
                          io_manager = io_manager->GetWeakPtr()              //
   ]() mutable {
+        TRACE_EVENT0("flutter", "ShellSetupUISubsystem");
         const auto& task_runners = shell->GetTaskRunners();
 
         // The animator is owned by the UI thread but it gets its vsync pulses
@@ -123,7 +129,7 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
                                                    std::move(vsync_waiter));
 
         engine = std::make_unique<Engine>(*shell,                        //
-                                          shell->GetDartVM(),            //
+                                          *shell->GetDartVM(),           //
                                           std::move(isolate_snapshot),   //
                                           std::move(shared_snapshot),    //
                                           task_runners,                  //
@@ -163,16 +169,16 @@ static void RecordStartupTimestamp() {
 // that cause shell initialization failures will still lead to some of their
 // settings being applied.
 static void PerformInitializationTasks(const blink::Settings& settings) {
+  {
+    fml::LogSettings log_settings;
+    log_settings.min_log_level =
+        settings.verbose_logging ? fml::LOG_INFO : fml::LOG_ERROR;
+    fml::SetLogSettings(log_settings);
+  }
+
   static std::once_flag gShellSettingsInitialization = {};
   std::call_once(gShellSettingsInitialization, [&settings] {
     RecordStartupTimestamp();
-
-    {
-      fml::LogSettings log_settings;
-      log_settings.min_log_level =
-          settings.verbose_logging ? fml::LOG_INFO : fml::LOG_ERROR;
-      fml::SetLogSettings(log_settings);
-    }
 
     tonic::SetLogHandler(
         [](const char* message) { FML_LOG(ERROR) << message; });
@@ -206,25 +212,34 @@ std::unique_ptr<Shell> Shell::Create(
     Shell::CreateCallback<Rasterizer> on_create_rasterizer) {
   PerformInitializationTasks(settings);
 
-  auto vm = blink::DartVM::ForProcess(settings);
+  TRACE_EVENT0("flutter", "Shell::Create");
+
+  auto vm = blink::DartVMRef::Create(settings);
   FML_CHECK(vm) << "Must be able to initialize the VM.";
+
+  auto vm_data = vm->GetVMData();
+
   return Shell::Create(std::move(task_runners),             //
                        std::move(settings),                 //
-                       vm->GetIsolateSnapshot(),            //
-                       blink::DartSnapshot::Empty(),        //
+                       vm_data->GetIsolateSnapshot(),       // isolate snapshot
+                       blink::DartSnapshot::Empty(),        // shared snapshot
                        std::move(on_create_platform_view),  //
-                       std::move(on_create_rasterizer)      //
+                       std::move(on_create_rasterizer),     //
+                       std::move(vm)                        //
   );
 }
 
 std::unique_ptr<Shell> Shell::Create(
     blink::TaskRunners task_runners,
     blink::Settings settings,
-    fml::RefPtr<blink::DartSnapshot> isolate_snapshot,
-    fml::RefPtr<blink::DartSnapshot> shared_snapshot,
+    fml::RefPtr<const blink::DartSnapshot> isolate_snapshot,
+    fml::RefPtr<const blink::DartSnapshot> shared_snapshot,
     Shell::CreateCallback<PlatformView> on_create_platform_view,
-    Shell::CreateCallback<Rasterizer> on_create_rasterizer) {
+    Shell::CreateCallback<Rasterizer> on_create_rasterizer,
+    blink::DartVMRef vm) {
   PerformInitializationTasks(settings);
+
+  TRACE_EVENT0("flutter", "Shell::CreateWithSnapshots");
 
   if (!task_runners.IsValid() || !on_create_platform_view ||
       !on_create_rasterizer) {
@@ -235,16 +250,18 @@ std::unique_ptr<Shell> Shell::Create(
   std::unique_ptr<Shell> shell;
   fml::TaskRunner::RunNowOrPostTask(
       task_runners.GetPlatformTaskRunner(),
-      [&latch,                                          //
-       &shell,                                          //
-       task_runners = std::move(task_runners),          //
-       settings,                                        //
-       isolate_snapshot = std::move(isolate_snapshot),  //
-       shared_snapshot = std::move(shared_snapshot),    //
-       on_create_platform_view,                         //
-       on_create_rasterizer                             //
-  ]() {
-        shell = CreateShellOnPlatformThread(std::move(task_runners),      //
+      fml::MakeCopyable([&latch,                                          //
+                         vm = std::move(vm),                              //
+                         &shell,                                          //
+                         task_runners = std::move(task_runners),          //
+                         settings,                                        //
+                         isolate_snapshot = std::move(isolate_snapshot),  //
+                         shared_snapshot = std::move(shared_snapshot),    //
+                         on_create_platform_view,                         //
+                         on_create_rasterizer                             //
+  ]() mutable {
+        shell = CreateShellOnPlatformThread(std::move(vm),
+                                            std::move(task_runners),      //
                                             settings,                     //
                                             std::move(isolate_snapshot),  //
                                             std::move(shared_snapshot),   //
@@ -252,15 +269,18 @@ std::unique_ptr<Shell> Shell::Create(
                                             on_create_rasterizer          //
         );
         latch.Signal();
-      });
+      }));
   latch.Wait();
   return shell;
 }
 
-Shell::Shell(blink::TaskRunners task_runners, blink::Settings settings)
+Shell::Shell(blink::DartVMRef vm,
+             blink::TaskRunners task_runners,
+             blink::Settings settings)
     : task_runners_(std::move(task_runners)),
       settings_(std::move(settings)),
-      vm_(blink::DartVM::ForProcess(settings_)) {
+      vm_(std::move(vm)) {
+  FML_CHECK(vm_) << "Must have access to VM to create a shell.";
   FML_DCHECK(task_runners_.IsValid());
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
 
@@ -302,9 +322,7 @@ Shell::~Shell() {
   PersistentCache::GetCacheForProcess()->RemoveWorkerTaskRunner(
       task_runners_.GetIOTaskRunner());
 
-  if (auto vm = blink::DartVM::ForProcessIfInitialized()) {
-    vm->GetServiceProtocol().RemoveHandler(this);
-  }
+  vm_->GetServiceProtocol()->RemoveHandler(this);
 
   fml::AutoResetWaitableEvent ui_latch, gpu_latch, platform_latch, io_latch;
 
@@ -375,12 +393,13 @@ bool Shell::Setup(std::unique_ptr<PlatformView> platform_view,
 
   is_setup_ = true;
 
-  if (auto vm = blink::DartVM::ForProcessIfInitialized()) {
-    vm->GetServiceProtocol().AddHandler(this, GetServiceProtocolDescription());
-  }
+  vm_->GetServiceProtocol()->AddHandler(this, GetServiceProtocolDescription());
 
   PersistentCache::GetCacheForProcess()->AddWorkerTaskRunner(
       task_runners_.GetIOTaskRunner());
+
+  PersistentCache::GetCacheForProcess()->SetIsDumpingSkp(
+      settings_.dump_skp_on_shader_compilation);
 
   return true;
 }
@@ -408,12 +427,13 @@ fml::WeakPtr<PlatformView> Shell::GetPlatformView() {
   return platform_view_->GetWeakPtr();
 }
 
-blink::DartVM& Shell::GetDartVM() const {
-  return *vm_;
+blink::DartVM* Shell::GetDartVM() {
+  return &vm_;
 }
 
 // |shell::PlatformView::Delegate|
 void Shell::OnPlatformViewCreated(std::unique_ptr<Surface> surface) {
+  TRACE_EVENT0("flutter", "Shell::OnPlatformViewCreated");
   FML_DCHECK(is_setup_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
 
@@ -434,16 +454,35 @@ void Shell::OnPlatformViewCreated(std::unique_ptr<Surface> surface) {
     latch.Signal();
   });
 
+  // The normal flow exectued by this method is that the platform thread is
+  // starting the sequence and waiting on the latch. Later the UI thread posts
+  // gpu_task to the GPU thread which signals the latch. If the GPU the and
+  // platform threads are the same this results in a deadlock as the gpu_task
+  // will never be posted to the plaform/gpu thread that is blocked on a latch.
+  // To avoid the described deadlock, if the gpu and the platform threads are
+  // the same, should_post_gpu_task will be false, and then instead of posting a
+  // task to the gpu thread, the ui thread just signals the latch and the
+  // platform/gpu thread follows with executing gpu_task.
+  bool should_post_gpu_task =
+      task_runners_.GetGPUTaskRunner() != task_runners_.GetPlatformTaskRunner();
+
   auto ui_task = [engine = engine_->GetWeakPtr(),                      //
                   gpu_task_runner = task_runners_.GetGPUTaskRunner(),  //
-                  gpu_task                                             //
+                  gpu_task, should_post_gpu_task,
+                  &latch  //
   ] {
     if (engine) {
       engine->OnOutputSurfaceCreated();
     }
     // Step 2: Next, tell the GPU thread that it should create a surface for its
     // rasterizer.
-    fml::TaskRunner::RunNowOrPostTask(gpu_task_runner, gpu_task);
+    if (should_post_gpu_task) {
+      fml::TaskRunner::RunNowOrPostTask(gpu_task_runner, gpu_task);
+    } else {
+      // See comment on should_post_gpu_task, in this case we just unblock
+      // the platform thread.
+      latch.Signal();
+    }
   };
 
   // Threading: Capture platform view by raw pointer and not the weak pointer.
@@ -468,10 +507,17 @@ void Shell::OnPlatformViewCreated(std::unique_ptr<Surface> surface) {
   fml::TaskRunner::RunNowOrPostTask(task_runners_.GetIOTaskRunner(), io_task);
 
   latch.Wait();
+  if (!should_post_gpu_task) {
+    // See comment on should_post_gpu_task, in this case the gpu_task
+    // wasn't executed, and we just run it here as the platform thread
+    // is the GPU thread.
+    gpu_task();
+  }
 }
 
 // |shell::PlatformView::Delegate|
 void Shell::OnPlatformViewDestroyed() {
+  TRACE_EVENT0("flutter", "Shell::OnPlatformViewDestroyed");
   FML_DCHECK(is_setup_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
 
@@ -501,21 +547,46 @@ void Shell::OnPlatformViewDestroyed() {
     fml::TaskRunner::RunNowOrPostTask(io_task_runner, io_task);
   };
 
+  // The normal flow exectued by this method is that the platform thread is
+  // starting the sequence and waiting on the latch. Later the UI thread posts
+  // gpu_task to the GPU thread triggers signaling the latch(on the IO thread).
+  // If the GPU the and platform threads are the same this results in a deadlock
+  // as the gpu_task will never be posted to the plaform/gpu thread that is
+  // blocked on a latch.  To avoid the described deadlock, if the gpu and the
+  // platform threads are the same, should_post_gpu_task will be false, and then
+  // instead of posting a task to the gpu thread, the ui thread just signals the
+  // latch and the platform/gpu thread follows with executing gpu_task.
+  bool should_post_gpu_task =
+      task_runners_.GetGPUTaskRunner() != task_runners_.GetPlatformTaskRunner();
+
   auto ui_task = [engine = engine_->GetWeakPtr(),
-                  gpu_task_runner = task_runners_.GetGPUTaskRunner(),
-                  gpu_task]() {
+                  gpu_task_runner = task_runners_.GetGPUTaskRunner(), gpu_task,
+                  should_post_gpu_task, &latch]() {
     if (engine) {
       engine->OnOutputSurfaceDestroyed();
     }
     // Step 1: Next, tell the GPU thread that its rasterizer should suspend
     // access to the underlying surface.
-    fml::TaskRunner::RunNowOrPostTask(gpu_task_runner, gpu_task);
+    if (should_post_gpu_task) {
+      fml::TaskRunner::RunNowOrPostTask(gpu_task_runner, gpu_task);
+    } else {
+      // See comment on should_post_gpu_task, in this case we just unblock
+      // the platform thread.
+      latch.Signal();
+    }
   };
 
   // Step 0: Post a task onto the UI thread to tell the engine that its output
   // surface is about to go away.
   fml::TaskRunner::RunNowOrPostTask(task_runners_.GetUITaskRunner(), ui_task);
   latch.Wait();
+  if (!should_post_gpu_task) {
+    // See comment on should_post_gpu_task, in this case the gpu_task
+    // wasn't executed, and we just run it here as the platform thread
+    // is the GPU thread.
+    gpu_task();
+    latch.Wait();
+  }
 }
 
 // |shell::PlatformView::Delegate|
@@ -807,10 +878,8 @@ void Shell::OnPreEngineRestart() {
 // |shell::Engine::Delegate|
 void Shell::UpdateIsolateDescription(const std::string isolate_name,
                                      int64_t isolate_port) {
-  if (auto vm = blink::DartVM::ForProcessIfInitialized()) {
-    Handler::Description description(isolate_port, isolate_name);
-    vm->GetServiceProtocol().SetHandlerDescription(this, description);
-  }
+  Handler::Description description(isolate_port, isolate_name);
+  vm_->GetServiceProtocol()->SetHandlerDescription(this, description);
 }
 
 // |blink::ServiceProtocol::Handler|

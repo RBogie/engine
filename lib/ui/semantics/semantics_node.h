@@ -81,11 +81,15 @@ struct SemanticsNode {
   bool HasAction(SemanticsAction action);
   bool HasFlag(SemanticsFlags flag);
 
+  // Whether this node is for embedded platform views.
+  bool IsPlatformViewNode() const;
+
   int32_t id = 0;
   int32_t flags = 0;
   int32_t actions = 0;
   int32_t textSelectionBase = -1;
   int32_t textSelectionExtent = -1;
+  int32_t platformViewId = -1;
   int32_t scrollChildren = 0;
   int32_t scrollIndex = 0;
   double scrollPosition = std::nan("");
